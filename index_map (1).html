@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Crop rotation options for your field</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.css">
+<style>
+:root{--bg:#eef2ee;--ink:#1d2b25;--muted:#5b6a62;--line:#cfd9d2;--card:#fff;--accent:#2f6b4f;--warn:#9a5b1a}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+main{max-width:820px;margin:0 auto;padding:28px 18px 60px}
+h1{font-size:1.6rem;margin:0 0 6px}
+h2{font-size:1.05rem;margin:0 0 10px}
+.lead{color:var(--muted);margin:0 0 18px}
+#map{height:340px;border:1px solid var(--line);border-radius:10px}
+.bar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:12px 0}
+button,select{font:inherit;padding:9px 12px;border-radius:6px;border:1px solid var(--line);background:#fff;color:var(--ink)}
+button{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600;cursor:pointer}
+:focus-visible{outline:3px solid var(--accent);outline-offset:2px}
+#status{color:var(--muted);min-height:1.5em}
+#status.err{color:var(--warn)}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px;margin-top:14px}
+.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
+.stats b{display:block;font-size:1.3rem}
+.stats span{color:var(--muted);font-size:.9rem}
+.plan h2{display:flex;justify-content:space-between;gap:10px}
+.years{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
+.year{border-left:3px solid var(--accent);padding-left:10px}
+.year b{display:block}
+.pro{color:var(--accent);font-size:.9rem}
+.con{color:var(--warn);font-size:.9rem}
+.note{color:var(--muted);font-size:.88rem;margin-top:18px}
+[hidden]{display:none}
+@media(max-width:560px){.stats,.years{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<main>
+  <h1>Crop rotation options for your field</h1>
+  <p class="lead">Click your field on the map. We load NASA climate history for that point and suggest three rotation plans.</p>
+
+  <div id="map" role="application" aria-label="Map: click to choose a location"></div>
+  <div class="bar">
+    <button id="pilot" type="button">Use pilot area (Akmola)</button>
+    <label>Previous crop (optional)
+      <select id="prev"></select>
+    </label>
+  </div>
+  <p id="status" role="status" aria-live="polite">No location selected yet.</p>
+
+  <section id="climate" class="card" hidden>
+    <h2>NASA climate history for this point</h2>
+    <div class="stats">
+      <div><b id="sT">–</b><span>Mean growing-season temperature</span></div>
+      <div><b id="sP">–</b><span>Growing-season precipitation</span></div>
+      <div><b id="sD">–</b><span>Dry seasons in the record</span></div>
+    </div>
+    <p class="note" id="sNote"></p>
+  </section>
+  <section id="out" aria-live="polite"></section>
+
+  <p class="note">These are risk estimates based on historical NASA POWER data, not a weather forecast. Growing season is April to September. Crop parameters are placeholders until the team agronomist provides final values.</p>
+</main>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js"></script>
+<script>
+// ---------- Crop data (placeholder values, replace with agronomist data) ----------
+const CROPS = {
+  wheat:     { name: "Wheat",     family: "cereal",     temp: [12, 22], water: 350, drought: 0.5, soil: -0.5 },
+  barley:    { name: "Barley",    family: "cereal",     temp: [10, 20], water: 300, drought: 0.7, soil: -0.4 },
+  peas:      { name: "Peas",      family: "legume",     temp: [12, 20], water: 400, drought: 0.4, soil: 0.8 },
+  lentils:   { name: "Lentils",   family: "legume",     temp: [14, 22], water: 300, drought: 0.8, soil: 0.7 },
+  alfalfa:   { name: "Alfalfa",   family: "legume",     temp: [10, 24], water: 450, drought: 0.7, soil: 0.9 },
+  sunflower: { name: "Sunflower", family: "asteraceae", temp: [18, 27], water: 400, drought: 0.7, soil: -0.6 },
+};
+const WEIGHTS = { waterEfficiency: 0.30, droughtResilience: 0.25, compatibility: 0.20, soilSustainability: 0.15, climateSuitability: 0.10 };
+const PRO = { waterEfficiency: "enough water", droughtResilience: "tolerates drought", compatibility: "fits well after the previous crop", soilSustainability: "protects the soil", climateSuitability: "suits the temperature" };
+const CON = { waterEfficiency: "water may be short", droughtResilience: "vulnerable to drought", compatibility: "poor previous crop", soilSustainability: "depletes the soil", climateSuitability: "temperature is off for this crop" };
+
+// ---------- Rotation algorithm ----------
+function scoreCriteria(crop, prev, c) {
+  const waterEfficiency = crop.water <= c.rain ? 1 : c.rain / crop.water;
+  const droughtResilience = 1 - c.risk * (1 - crop.drought);
+  let compatibility = 0.6;
+  if (prev) {
+    if (prev.family === crop.family) compatibility = 0.2;
+    else if (prev.family === "legume") compatibility = 1;
+  }
+  const soilSustainability = (crop.soil + 1) / 2;
+  const [min, max] = crop.temp;
+  const dist = c.temp < min ? min - c.temp : c.temp > max ? c.temp - max : 0;
+  const climateSuitability = Math.max(0, 1 - dist / 8);
+  return { waterEfficiency, droughtResilience, compatibility, soilSustainability, climateSuitability };
+}
+function evaluate(ids, prevId, c) {
+  let prev = prevId ? CROPS[prevId] : null, sum = 0;
+  const years = ids.map(id => {
+    const crop = CROPS[id], cr = scoreCriteria(crop, prev, c);
+    let total = 0;
+    for (const k in WEIGHTS) total += cr[k] * WEIGHTS[k];
+    const keys = Object.keys(cr).sort((a, b) => cr[b] - cr[a]);
+    const pros = keys.filter(k => cr[k] >= 0.7).slice(0, 2).map(k => PRO[k]);
+    const weak = keys[keys.length - 1];
+    sum += total; prev = crop;
+    return { name: crop.name, pros, con: cr[weak] < 0.5 ? CON[weak] : "" };
+  });
+  return { years, total: sum / ids.length };
+}
+function best(prevId, c, n = 3, topN = 3) {
+  const ids = Object.keys(CROPS), all = [];
+  (function build(cur) {
+    if (cur.length === n) { all.push(evaluate(cur, prevId, c)); return; }
+    ids.forEach(id => build([...cur, id]));
+  })([]);
+  return all.sort((a, b) => b.total - a.total).slice(0, topN);
+}
+
+// ---------- NASA POWER: monthly data for one point ----------
+const FIRST = 2006, LAST = 2025, DAYS = [30, 31, 30, 31, 31, 30]; // Apr..Sep
+const avg = a => a.reduce((s, x) => s + x, 0) / a.length;
+
+async function loadClimate(lat, lon) {
+  const url = "https://power.larc.nasa.gov/api/temporal/monthly/point?parameters=T2M,PRECTOTCORR&community=AG" +
+    `&longitude=${lon}&latitude=${lat}&start=${FIRST}&end=${LAST}&format=JSON`;
+  const r = await fetch(url);
+  if (!r.ok) throw new Error("NASA POWER returned status " + r.status);
+  const d = (await r.json()).properties.parameter;
+  const seasons = [];
+  for (let y = FIRST; y <= LAST; y++) {
+    let t = 0, p = 0, ok = true;
+    for (let i = 0; i < 6; i++) {
+      const k = y + String(4 + i).padStart(2, "0");
+      const tv = d.T2M[k], pv = d.PRECTOTCORR[k];
+      if (tv == null || pv == null || tv < -900 || pv < -900) { ok = false; break; }
+      t += tv / 6; p += pv * DAYS[i]; // mm/day -> mm per month
+    }
+    if (ok) seasons.push({ y, t, p });
+  }
+  if (seasons.length < 5) throw new Error("Not enough NASA data for this point.");
+  const temp = avg(seasons.map(s => s.t)), rain = avg(seasons.map(s => s.p));
+  const dry = seasons.filter(s => s.p < 0.8 * rain).length; // dry = below 80% of average
+  return { temp, rain, dry, n: seasons.length, risk: dry / seasons.length };
+}
+
+// ---------- UI ----------
+const $ = id => document.getElementById(id);
+let climate = null;
+$("prev").innerHTML = '<option value="">Unknown / new field</option>' +
+  Object.entries(CROPS).map(([id, c]) => `<option value="${id}">${c.name}</option>`).join("");
+
+const map = L.map("map").setView([48, 67], 5);
+L.tileLayer("https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png", {
+  maxZoom: 12, subdomains: "abcd",
+  attribution: "&copy; OpenStreetMap contributors &copy; CARTO"
+}).addTo(map);
+let marker = null;
+
+function setStatus(msg, err) { $("status").textContent = msg; $("status").className = err ? "err" : ""; }
+
+function render() {
+  if (!climate) return;
+  const plans = best($("prev").value, climate);
+  $("out").innerHTML = plans.map((p, i) => `
+    <article class="card plan">
+      <h2><span>Option ${i + 1}</span><span>score ${p.total.toFixed(2)} of 1</span></h2>
+      <div class="years">${p.years.map((y, j) => `
+        <div class="year"><b>Season ${j + 1}: ${y.name}</b>
+          <div class="pro">${y.pros.length ? "Pros: " + y.pros.join(", ") : "Balanced choice"}</div>
+          ${y.con ? `<div class="con">Risk: ${y.con}</div>` : ""}
+        </div>`).join("")}
+      </div>
+    </article>`).join("");
+}
+
+async function pick(lat, lon) {
+  lat = +lat.toFixed(3); lon = +lon.toFixed(3);
+  if (marker) marker.setLatLng([lat, lon]);
+  else marker = L.circleMarker([lat, lon], { radius: 9, color: "#2f6b4f", fillColor: "#2f6b4f", fillOpacity: 0.8 }).addTo(map);
+  setStatus(`Loading NASA data for ${lat}, ${lon}…`);
+  $("out").innerHTML = ""; $("climate").hidden = true; climate = null;
+  try {
+    climate = await loadClimate(lat, lon);
+    $("sT").textContent = climate.temp.toFixed(1) + " °C";
+    $("sP").textContent = Math.round(climate.rain) + " mm";
+    $("sD").textContent = `${climate.dry} of ${climate.n}`;
+    $("sNote").textContent = `Based on ${climate.n} growing seasons (${FIRST}–${LAST}). A season counts as dry if precipitation is below 80% of the average.`;
+    $("climate").hidden = false;
+    setStatus(`Showing results for ${lat}, ${lon}.`);
+    render();
+  } catch (e) {
+    setStatus("Could not load NASA data: " + e.message + " Check your internet connection and try again.", true);
+  }
+}
+
+map.on("click", e => pick(e.latlng.lat, e.latlng.lng));
+$("pilot").addEventListener("click", () => { map.setView([51.66, 71.0], 8); pick(51.66, 71.0); });
+$("prev").addEventListener("change", render);
+</script>
+</body>
+</html>
